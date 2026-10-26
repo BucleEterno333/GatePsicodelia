@@ -30,6 +30,9 @@ DONOR_ADDRESS    = os.environ.get(
     '233 Kurrajong Rd, Prestons NSW 2170, Australia'
 )
 
+# ZIP code (necesario porque Northflank corre en USA)
+ZIP_CODE = os.environ.get('ZIP_CODE', '10001')
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -155,6 +158,97 @@ class UnicefChecker:
                     return True
             except Exception:
                 continue
+        return False
+
+    # ============================================================
+    # ZIP CODE (necesario porque el server corre en USA)
+    # ============================================================
+    def _fill_zip_code(self, ctx, verbose=False):
+        """Rellena el ZIP code si aparece (Stripe lo pide por geolocalización)."""
+        selectors = [
+            '#payment-postalInput',
+            'input[name="postal"]',
+            'input[name="postalCode"]',
+            'input[name="zip"]',
+            'input[name="zipCode"]',
+            'input[autocomplete="postal-code"]',
+            'input[placeholder*="ZIP" i]',
+            'input[placeholder*="Postal" i]',
+            'input[placeholder*="Código postal" i]',
+            'input[aria-label*="ZIP" i]',
+            'input[aria-label*="Postal" i]',
+        ]
+        for sel in selectors:
+            try:
+                loc = ctx.locator(sel).first
+                if loc.count() > 0 and loc.is_visible():
+                    # Verificar si ya está lleno correctamente
+                    try:
+                        current = loc.input_value()
+                    except Exception:
+                        current = ''
+                    if current == ZIP_CODE:
+                        if verbose:
+                            logger.info(f"📮 ZIP ya estaba lleno: {ZIP_CODE}")
+                        return True
+                    loc.click(timeout=3000)
+                    time.sleep(0.15)
+                    try:
+                        loc.fill('')
+                    except Exception:
+                        # En algunos inputs readonly, forzar con teclado
+                        loc.press('Control+A')
+                        loc.press('Delete')
+                    time.sleep(0.1)
+                    loc.fill(ZIP_CODE)
+                    time.sleep(0.3)
+                    try:
+                        loc.evaluate("""el => {
+                            el.dispatchEvent(new Event('input',  {bubbles:true}));
+                            el.dispatchEvent(new Event('change', {bubbles:true}));
+                            el.dispatchEvent(new Event('blur',   {bubbles:true}));
+                        }""")
+                    except Exception:
+                        pass
+                    logger.info(f"📮 ZIP rellenado con {ZIP_CODE} vía {sel}")
+                    return True
+            except Exception:
+                continue
+        if verbose:
+            logger.info("ℹ️ No se encontró campo ZIP code (probablemente no requerido)")
+        return False
+
+    def _has_zip_error(self, ctx):
+        """Detecta si hay un error rojo tipo 'Your ZIP code is invalid'."""
+        try:
+            for sel in [
+                '[aria-invalid="true"]',
+                '[class*="FieldError"]',
+                '[class*="error" i]',
+            ]:
+                loc = ctx.locator(sel)
+                n = loc.count()
+                for i in range(min(n, 10)):
+                    try:
+                        el = loc.nth(i)
+                        if el.is_visible():
+                            txt = el.inner_text().strip().lower() if el.inner_text else ''
+                            if 'zip' in txt or 'postal' in txt:
+                                return True
+                    except Exception:
+                        pass
+            # Chequear atributo aria-invalid en el input de postal
+            for sel in ['#payment-postalInput', 'input[name="postal"]',
+                        'input[autocomplete="postal-code"]']:
+                try:
+                    loc = ctx.locator(sel).first
+                    if loc.count() > 0:
+                        if loc.get_attribute('aria-invalid') == 'true':
+                            return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
         return False
 
     # ---------------- pasos del flow ----------------
@@ -449,6 +543,9 @@ class UnicefChecker:
         cvc.click(); time.sleep(0.2)
         cvc.fill(card_info['cvv']); time.sleep(0.6)
 
+        # 🔥 ZIP CODE (Stripe lo pide porque el server está en USA)
+        zip_ok = self._fill_zip_code(ctx, verbose=True)
+
         try:
             cvc.press('Tab')
             time.sleep(1.0)
@@ -456,7 +553,8 @@ class UnicefChecker:
             pass
 
         try:
-            logger.info(f"📋 num='{num.input_value()}' exp='{exp.input_value()}' cvc='{cvc.input_value()}'")
+            logger.info(f"📋 num='{num.input_value()}' exp='{exp.input_value()}' "
+                        f"cvc='{cvc.input_value()}' zip_ok={zip_ok}")
         except Exception:
             pass
 
@@ -584,6 +682,9 @@ class UnicefChecker:
             'unable to process', 'error de pago', 'pago fall',
         )
         for item in new_items:
+            # Ignorar errores de ZIP (no son decline real, son validación local)
+            if 'zip' in item or 'postal' in item:
+                continue
             if any(k in item for k in dead_kw):
                 logger.info(f"🆕 Error NUEVO: '{item[:100]}'")
                 return True
@@ -628,7 +729,10 @@ class UnicefChecker:
                     pass
         return 'unknown'
 
-    def _wait_for_button_ready(self, span, timeout=20):
+    def _wait_for_button_ready(self, span, timeout=20, ctx=None):
+        """Espera que el botón esté enabled. Re-rellena ZIP si sigue deshabilitado."""
+        start = time.time()
+        zip_retry_done = False
         for _ in range(timeout * 2):
             try:
                 if span is not None and span.count() > 0 and span.is_visible():
@@ -636,6 +740,11 @@ class UnicefChecker:
                     if 'process payment' in txt:
                         if not self._get_btn_disabled(span):
                             return True
+                        # Botón deshabilitado → probablemente ZIP requerido
+                        if not zip_retry_done and ctx is not None and (time.time() - start) > 3:
+                            logger.info("🔧 Botón disabled >3s → reintentando ZIP")
+                            self._fill_zip_code(ctx, verbose=False)
+                            zip_retry_done = True
             except Exception:
                 pass
             time.sleep(0.5)
@@ -697,9 +806,22 @@ class UnicefChecker:
             btn = span
         target = btn if btn is not None else span
 
+        # 🔥 Antes de esperar, asegurar ZIP si el botón está disabled
+        ctx_for_zip = self._find_card_context()
+        if ctx_for_zip is not None and self._get_btn_disabled(span):
+            logger.info("🔧 Botón deshabilitado → re-llenando ZIP")
+            self._fill_zip_code(ctx_for_zip, verbose=False)
+
         if span is not None:
-            if not self._wait_for_button_ready(span, timeout=15):
-                logger.warning("⚠️ Botón no 'ready' en 15s — intentamos igual")
+            if not self._wait_for_button_ready(span, timeout=20, ctx=ctx_for_zip):
+                logger.warning("⚠️ Botón no 'ready' en 20s — chequeando ZIP error")
+                if ctx_for_zip is not None and self._has_zip_error(ctx_for_zip):
+                    logger.info("🔧 Error de ZIP detectado → re-llenando")
+                    self._fill_zip_code(ctx_for_zip, verbose=False)
+                    time.sleep(1)
+                    self._wait_for_button_ready(span, timeout=10, ctx=ctx_for_zip)
+                else:
+                    logger.warning("⚠️ Continuamos igual")
 
         pre_errors = self._snapshot_errors()
         pre_btn_text = self._get_btn_text(span)
@@ -742,6 +864,13 @@ class UnicefChecker:
 
         for name, action, wait_secs in attempts:
             logger.info(f"   ▶️  [{name}] (esperando hasta {wait_secs}s)")
+
+            # 🔥 Antes de CADA intento, verificar si ZIP necesita re-llenarse
+            if ctx_for_zip is not None and self._has_zip_error(ctx_for_zip):
+                logger.info("   🔧 ZIP error detectado antes del intento → re-llenando")
+                self._fill_zip_code(ctx_for_zip, verbose=False)
+                time.sleep(0.5)
+
             try:
                 action()
             except Exception as e:
@@ -789,8 +918,18 @@ class UnicefChecker:
                 spans = c.locator('#button-text').all()
                 buttons = c.locator('button').all()
                 has_proc = c.locator(':text("Process Payment")').count()
+                # ¿ZIP?
+                zip_sel = c.locator('#payment-postalInput, input[name="postal"], input[autocomplete="postal-code"]')
+                zip_count = zip_sel.count()
+                zip_val = ''
+                if zip_count > 0:
+                    try:
+                        zip_val = zip_sel.first.input_value()
+                    except Exception:
+                        pass
                 logger.warning(f"[ctx {i}] url={url} | #button-text={len(spans)} | "
-                               f"buttons={len(buttons)} | 'Process Payment' matches={has_proc}")
+                               f"buttons={len(buttons)} | 'Process Payment' matches={has_proc} | "
+                               f"zip_count={zip_count} zip_val='{zip_val}'")
                 for j, s in enumerate(spans[:3]):
                     try:
                         t = s.inner_text().strip()[:40]
@@ -1070,8 +1209,8 @@ def process_cards_worker(cards, amount, stop_on_live):
 @app.route('/')
 def index():
     return jsonify({
-        "status": "online", "service": "UNICEF AU Checker", "version": "2.3",
-        "mode": "persistent_session + hardcoded_02_btn_click_normal",
+        "status": "online", "service": "UNICEF AU Checker", "version": "2.4",
+        "mode": "persistent_session + auto_zip_code",
         "endpoints": {
             "health": "/api/health", "status": "/api/status",
             "check_card": "/api/check-card (POST)",
@@ -1080,7 +1219,7 @@ def index():
         },
         "config": {
             "headless": HEADLESS, "donation_amount": DONATION_AMOUNT,
-            "cvv_api": bool(CVV_API_URL),
+            "cvv_api": bool(CVV_API_URL), "zip_code": ZIP_CODE,
         },
     })
 
@@ -1088,7 +1227,7 @@ def index():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     return jsonify({'status': 'online', 'service': 'UNICEF AU Checker',
-                    'version': '2.3', 'timestamp': datetime.now().isoformat()})
+                    'version': '2.4', 'timestamp': datetime.now().isoformat()})
 
 
 @app.route('/api/status', methods=['GET'])
@@ -1162,6 +1301,5 @@ def cancel_check():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     debug = os.environ.get('FLASK_ENV', 'development') == 'development'
-    logger.info(f"🚀 Puerto {port} (headless={HEADLESS}, amount=${DONATION_AMOUNT}) — "
-                f"v2.3 02_btn_click_normal hardcodeado")
+    logger.info(f"🚀 Puerto {port} (headless={HEADLESS}, amount=${DONATION_AMOUNT}, zip=${ZIP_CODE}) — v2.4 auto ZIP")
     app.run(host='0.0.0.0', port=port, debug=debug, use_reloader=False)

